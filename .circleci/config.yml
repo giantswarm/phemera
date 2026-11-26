@@ -1,0 +1,254 @@
+# Fork (giantswarm/phemera): the line's publishing pipeline, hand-written and
+# ours to keep (FORK.md, "Publishing"); devctl generates nothing here.
+#
+# Every push to `giantswarm` publishes phemera's two images, built from
+# upstream's Containerfiles as they are, under the line's own path on gsoci:
+#
+#   gsoci.azurecr.io/giantswarm/phemera/authority:<version>
+#   gsoci.azurecr.io/giantswarm/phemera/ssh-proxy:<version>
+#
+# <version> is gitsemver's dev version of the pushed commit, and `latest`
+# follows the branch. The Containerfiles compile for the platform they build
+# on, so each platform is built natively on a machine of its architecture
+# (`build-image`) and `push-to-registries` joins the two digests into one
+# index, signed and attested (SLSA provenance, SPDX SBOM) with the org's
+# CircleCI identity. Each index carries the upstream commit it was built from
+# as the annotation `io.giantswarm.upstream.version=main@<full sha>`.
+# `verify` then pulls both indexes without credentials and checks the
+# platforms and the annotation; `scan` runs Trivy on them. Nothing is
+# published from GitHub Actions or by hand.
+#
+# Pull-request branches run the same builds with `push: false` (the
+# `validate` workflow). The sync's candidate branch `sync/main` is checked by
+# the line's GitHub Actions gate (`ci-ok`, .github/workflows/fork-ci.yaml),
+# not here.
+version: 2.1
+
+orbs:
+  architect: giantswarm/architect@10.18.0
+
+# The line is upstream `main` plus the fork's own files (FORK.md, "Branches"),
+# so the upstream commit a build is made of is the merge base of the built
+# commit with upstream `main`. Run before a push job's own steps, it exports
+# that commit for the index annotation below; `verify` checks the annotation
+# on what was pushed.
+upstream_pin: &upstream_pin
+  - checkout
+  - run:
+      name: Resolve the upstream commit of this build
+      command: |
+        set -o errexit -o nounset -o pipefail
+        git fetch --quiet https://github.com/phemera-dev/phemera.git main
+        pin=$(git merge-base "${CIRCLE_SHA1}" FETCH_HEAD)
+        echo "phemera-dev/phemera main@${pin}"
+        echo "export UPSTREAM_PIN=${pin}" >> "${BASH_ENV}"
+
+upstream_annotation: &upstream_annotation |
+  index:io.giantswarm.upstream.version=main@${UPSTREAM_PIN}
+
+publish_filters: &publish_filters
+  branches:
+    only: giantswarm
+
+validate_filters: &validate_filters
+  branches:
+    ignore:
+      - giantswarm
+      - /sync\/.*/
+
+jobs:
+  # Both indexes, pulled without credentials: the images are public and this
+  # proves it. A build is published only when each index holds linux/amd64
+  # and linux/arm64 and names the upstream commit it was built from.
+  verify:
+    executor: architect/architect
+    resource_class: small
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Verify the published indexes
+          command: |
+            set -o errexit -o nounset -o pipefail
+            test -s .build_version
+            version=$(cat .build_version)
+            git fetch --quiet https://github.com/phemera-dev/phemera.git main
+            pin=$(git merge-base "${CIRCLE_SHA1}" FETCH_HEAD)
+            : > published.md
+            for image in authority ssh-proxy; do
+              ref="gsoci.azurecr.io/giantswarm/phemera/${image}:${version}"
+              index=$(oras manifest fetch "${ref}")
+              digest=$(oras manifest fetch --descriptor "${ref}" | jq -r .digest)
+              platforms=$(jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(",")' <<<"${index}")
+              if [ "${platforms}" != "linux/amd64,linux/arm64" ]; then
+                echo "ERROR: ${ref} (${digest}) holds '${platforms}', not linux/amd64 and linux/arm64" >&2
+                exit 1
+              fi
+              stamped=$(jq -r '.annotations["io.giantswarm.upstream.version"] // empty' <<<"${index}")
+              if [ "${stamped}" != "main@${pin}" ]; then
+                echo "ERROR: ${ref} (${digest}) is annotated '${stamped}', the build is of main@${pin}" >&2
+                exit 1
+              fi
+              echo "${ref}@${digest} ${platforms} upstream main@${pin}" | tee -a published.md
+            done
+      - store_artifacts:
+          path: published.md
+
+  # A fixable HIGH or CRITICAL finding fails the pipeline after the push: the
+  # fix belongs upstream (FORK.md, "Contributing"). Trivy runs as a container
+  # on the remote Docker host, which a bind mount of the checkout does not
+  # reach, so .trivyignore is copied into the container.
+  scan:
+    parameters:
+      image:
+        type: string
+    executor: architect/architect
+    resource_class: small
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Scan << parameters.image >>
+          command: |
+            set -o errexit -o nounset -o pipefail
+            test -s .build_version
+            ref="gsoci.azurecr.io/<< parameters.image >>:$(cat .build_version)"
+            echo "scanning ${ref}"
+            container="$(docker create \
+              --env TRIVY_DB_REPOSITORY=public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2 \
+              gsoci.azurecr.io/giantswarm/trivy:0.74.0 \
+              image --severity CRITICAL,HIGH --ignore-unfixed --ignorefile /.trivyignore \
+              --exit-code 1 --format table "${ref}")"
+            docker cp .trivyignore "${container}:/.trivyignore"
+            docker start --attach "${container}"
+
+workflows:
+  publish:
+    jobs:
+      - architect/build-image:
+          context: architect
+          name: build-image-authority-amd64
+          image: giantswarm/phemera/authority
+          dockerfile: authority/Containerfile
+          platform: linux/amd64
+          resource_class: medium
+          split-china-push: true
+          filters: *publish_filters
+      - architect/build-image:
+          context: architect
+          name: build-image-authority-arm64
+          image: giantswarm/phemera/authority
+          dockerfile: authority/Containerfile
+          platform: linux/arm64
+          resource_class: arm.medium
+          split-china-push: true
+          filters: *publish_filters
+      - architect/push-to-registries:
+          context: architect
+          name: push-to-registries-authority
+          image: giantswarm/phemera/authority
+          merge-digests: true
+          platforms: linux/amd64,linux/arm64
+          tag-latest-branch: giantswarm
+          split-china-push: true
+          annotations: *upstream_annotation
+          pre-steps: *upstream_pin
+          requires:
+            - build-image-authority-amd64
+            - build-image-authority-arm64
+          filters: *publish_filters
+
+      - architect/build-image:
+          context: architect
+          name: build-image-ssh-proxy-amd64
+          image: giantswarm/phemera/ssh-proxy
+          dockerfile: ssh-proxy/Containerfile
+          platform: linux/amd64
+          resource_class: medium
+          split-china-push: true
+          filters: *publish_filters
+      - architect/build-image:
+          context: architect
+          name: build-image-ssh-proxy-arm64
+          image: giantswarm/phemera/ssh-proxy
+          dockerfile: ssh-proxy/Containerfile
+          platform: linux/arm64
+          resource_class: arm.medium
+          split-china-push: true
+          filters: *publish_filters
+      # The authority's push job is the one that persists .build_version for
+      # the jobs downstream.
+      - architect/push-to-registries:
+          context: architect
+          name: push-to-registries-ssh-proxy
+          image: giantswarm/phemera/ssh-proxy
+          merge-digests: true
+          platforms: linux/amd64,linux/arm64
+          tag-latest-branch: giantswarm
+          split-china-push: true
+          persist-build-version: false
+          annotations: *upstream_annotation
+          pre-steps: *upstream_pin
+          requires:
+            - build-image-ssh-proxy-amd64
+            - build-image-ssh-proxy-arm64
+          filters: *publish_filters
+
+      - verify:
+          requires:
+            - push-to-registries-authority
+            - push-to-registries-ssh-proxy
+          filters: *publish_filters
+      - scan:
+          name: scan-authority
+          image: giantswarm/phemera/authority
+          requires:
+            - verify
+          filters: *publish_filters
+      - scan:
+          name: scan-ssh-proxy
+          image: giantswarm/phemera/ssh-proxy
+          requires:
+            - verify
+          filters: *publish_filters
+
+  # Pull-request branches: the same builds, nothing pushed. No credentials are
+  # used, so the jobs run without the context.
+  validate:
+    jobs:
+      - architect/build-image:
+          name: validate-authority-amd64
+          image: giantswarm/phemera/authority
+          dockerfile: authority/Containerfile
+          platform: linux/amd64
+          resource_class: medium
+          push: false
+          filters: *validate_filters
+      - architect/build-image:
+          name: validate-authority-arm64
+          image: giantswarm/phemera/authority
+          dockerfile: authority/Containerfile
+          platform: linux/arm64
+          resource_class: arm.medium
+          push: false
+          filters: *validate_filters
+      - architect/build-image:
+          name: validate-ssh-proxy-amd64
+          image: giantswarm/phemera/ssh-proxy
+          dockerfile: ssh-proxy/Containerfile
+          platform: linux/amd64
+          resource_class: medium
+          push: false
+          filters: *validate_filters
+      - architect/build-image:
+          name: validate-ssh-proxy-arm64
+          image: giantswarm/phemera/ssh-proxy
+          dockerfile: ssh-proxy/Containerfile
+          platform: linux/arm64
+          resource_class: arm.medium
+          push: false
+          filters: *validate_filters

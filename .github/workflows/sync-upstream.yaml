@@ -1,0 +1,157 @@
+# Fork (giantswarm/phemera): keeps the line on upstream `main` (FORK.md,
+# "Sync"). Every hour, and on demand, it
+#   1. mirrors upstream `main` into this fork's `main` (fast-forward; a mirror
+#      that is not an ancestor of upstream was edited and stops the run);
+#   2. when upstream moved, rebases the fork's own commits of `giantswarm`
+#      onto upstream `main` and pushes the result to the candidate branch
+#      `sync/main`, whose push runs the line's gate (`ci-ok`, fork-ci.yaml);
+#   3. once `ci-ok` passed on the candidate's head, lands exactly that commit
+#      on `giantswarm` with the lease on the head it was rebased from, which
+#      publishes it (.circleci/config.yml), and deletes the candidate branch.
+# A fork commit that conflicts with upstream, a red gate or a line that moved
+# while the candidate was checked fail the run and leave the line as it was;
+# the next run starts again from upstream `main`.
+# Pushes are made as the org's HeraldBot GitHub App (a token minted per run
+# from the org secrets HERALD_CLIENT_ID / HERALD_APP_KEY; the App is the
+# bypass actor of the line's rulesets): a push with GITHUB_TOKEN would trigger
+# no workflow, so the candidate's gate would never run.
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Do everything except push"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  LINE_BRANCH: giantswarm
+  CANDIDATE_BRANCH: sync/main
+  UPSTREAM_REPO: phemera-dev/phemera
+  # The check the line's ruleset requires on every update of the line.
+  REQUIRED_CHECK: ci-ok
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Mint the bot token
+        id: app
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ secrets.HERALD_CLIENT_ID }}
+          private-key: ${{ secrets.HERALD_APP_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.LINE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - name: Fetch upstream
+        run: |
+          set -o errexit -o nounset -o pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --quiet upstream main
+          git config user.name "HeraldBot[bot]"
+          git config user.email "149080493+heraldbot[bot]@users.noreply.github.com"
+
+      - name: Mirror upstream main
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -o errexit -o nounset -o pipefail
+          fork=$(git rev-parse origin/main)
+          up=$(git rev-parse upstream/main)
+          if [ "${fork}" = "${up}" ]; then
+            echo "- main: at upstream \`${up:0:12}\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "${fork}" "${up}"; then
+            echo "::error::origin/main ${fork:0:12} is not an ancestor of upstream/main ${up:0:12} — the mirror was edited or upstream rewrote its main; restore it by hand (FORK.md, 'Branches')"
+            exit 1
+          fi
+          echo "- main: \`${fork:0:12}\` → \`${up:0:12}\` (fast-forward)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${DRY_RUN}" != true ]; then
+            git push --force-with-lease="refs/heads/main:${fork}" origin "${up}:refs/heads/main"
+          fi
+
+      - name: Rebase the line onto upstream main
+        id: rebase
+        run: |
+          set -o errexit -o nounset -o pipefail
+          head=$(git rev-parse HEAD)
+          up=$(git rev-parse upstream/main)
+          pin=$(git merge-base HEAD upstream/main)
+          if [ "${pin}" = "${up}" ]; then
+            echo "- ${LINE_BRANCH}: on upstream main \`${up:0:12}\`, nothing to do" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git rebase --quiet --onto upstream/main "${pin}"; then
+            conflict=$(git rev-parse --short REBASE_HEAD 2>/dev/null || echo unknown)
+            git rebase --abort
+            subject=$(git log -1 --format=%s "${conflict}" 2>/dev/null || true)
+            echo "::error::the fork's commit ${conflict} (${subject}) conflicts with upstream main ${up:0:12}; rebase ${LINE_BRANCH} by hand (FORK.md, 'Sync')"
+            exit 1
+          fi
+          {
+            echo "- ${LINE_BRANCH}: upstream main \`${pin:0:12}\` → \`${up:0:12}\`, the fork's commits replayed:"
+            git log --reverse --format="  - \`%h\` %s" upstream/main..HEAD
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "head=${head}"
+            echo "candidate=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check the candidate
+        if: steps.rebase.outputs.candidate != '' && inputs.dry_run != true
+        env:
+          CANDIDATE: ${{ steps.rebase.outputs.candidate }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o errexit -o nounset -o pipefail
+          git push --force origin "${CANDIDATE}:refs/heads/${CANDIDATE_BRANCH}"
+          echo "- candidate \`${CANDIDATE_BRANCH}\` at \`${CANDIDATE:0:12}\`" >> "$GITHUB_STEP_SUMMARY"
+          # The gate's run starts on the push; its `ci-ok` check run appears
+          # once the jobs it needs have finished.
+          deadline=$((SECONDS + 45 * 60))
+          while :; do
+            conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${CANDIDATE}/check-runs?check_name=${REQUIRED_CHECK}&filter=latest" \
+              --jq 'if .total_count == 0 then "missing" elif all(.check_runs[]; .status == "completed") then ([.check_runs[].conclusion] | if all(. == "success") then "success" else join(",") end) else "pending" end')
+            case "${conclusion}" in
+              success) break ;;
+              missing|pending) ;;
+              *)
+                echo "- \`${REQUIRED_CHECK}\` on the candidate: ${conclusion}" >> "$GITHUB_STEP_SUMMARY"
+                echo "::error::${REQUIRED_CHECK} on the candidate ${CANDIDATE} is ${conclusion}; ${LINE_BRANCH} stays where it is"
+                exit 1
+                ;;
+            esac
+            if [ "${SECONDS}" -gt "${deadline}" ]; then
+              echo "::error::${REQUIRED_CHECK} on the candidate ${CANDIDATE} is still ${conclusion} after 45 minutes"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "- \`${REQUIRED_CHECK}\` on the candidate: success" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Land the candidate
+        if: steps.rebase.outputs.candidate != '' && inputs.dry_run != true
+        env:
+          CANDIDATE: ${{ steps.rebase.outputs.candidate }}
+          HEAD_SHA: ${{ steps.rebase.outputs.head }}
+        run: |
+          set -o errexit -o nounset -o pipefail
+          git push --force-with-lease="refs/heads/${LINE_BRANCH}:${HEAD_SHA}" origin "${CANDIDATE}:refs/heads/${LINE_BRANCH}"
+          git push origin --delete "${CANDIDATE_BRANCH}"
+          echo "- landed: \`${LINE_BRANCH}\` \`${HEAD_SHA:0:12}\` → \`${CANDIDATE:0:12}\`" >> "$GITHUB_STEP_SUMMARY"

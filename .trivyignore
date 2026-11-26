@@ -1,0 +1,5 @@
+# Fork (giantswarm/phemera): findings the line's image scan accepts
+# (.circleci/config.yml, job `scan`), one vulnerability ID per line with the
+# reason and the date it expires in a comment above it. A fixable finding is
+# fixed upstream (FORK.md, "Contributing"); an entry here only buys the time
+# until upstream ships the fix.
