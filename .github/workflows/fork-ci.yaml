@@ -1,0 +1,85 @@
+name: Line
+
+# Fork (giantswarm/phemera): the gate of the consumed branch `giantswarm`, the
+# one check its ruleset requires on every update (`ci-ok`; FORK.md,
+# "Branches"). It holds the line to what it publishes: upstream `main` as it is
+# plus the fork's own files, and both of upstream's Containerfiles building.
+# Upstream's own suite runs on pull requests beside it (ci.yaml).
+
+on:
+  # The sync's candidate (FORK.md, "Sync"): a rebased branch, landed by a push
+  # of the commit this run checked.
+  push:
+    branches:
+      - "sync/**"
+  pull_request:
+    branches:
+      - giantswarm
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref_name) || format('push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The line differs from upstream `main` in the fork's own files only, so the
+  # images are what upstream ships. Carrying a change to upstream's code is a
+  # decision of its own (FORK.md, "Contributing"), not a pull request that
+  # passes this check.
+  upstream-unchanged:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compare the line with upstream main
+        run: |
+          set -o errexit -o nounset -o pipefail
+          git fetch --quiet https://github.com/phemera-dev/phemera.git main
+          pin=$(git merge-base HEAD FETCH_HEAD)
+          echo "upstream phemera-dev/phemera main@${pin}"
+          changed=$(git diff --name-only "${pin}" HEAD)
+          printf '%s\n' "${changed}"
+          # The fork's own files (FORK.md, "The fork's own files").
+          other=$(printf '%s\n' "${changed}" | grep -v -x -E \
+            'FORK\.md|renovate\.json5|\.trivyignore|\.circleci/config\.yml|\.github/workflows/(fork-ci|sync-upstream)\.yaml' || true)
+          if [ -n "${other}" ]; then
+            printf '::error::the line changes upstream files: %s\n' "$(printf '%s' "${other}" | tr '\n' ' ')"
+            exit 1
+          fi
+
+  # What the publishing pipeline builds, for linux/amd64; CircleCI builds both
+  # platforms on the pull request and publishes from `giantswarm`.
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - authority
+          - ssh-proxy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker build --file "${IMAGE}/Containerfile" --tag "phemera-${IMAGE}:ci" .
+
+  ci-ok:
+    if: always()
+    needs:
+      - upstream-unchanged
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$RESULTS"
+          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS" > /dev/null

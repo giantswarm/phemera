@@ -1,0 +1,9 @@
+// Fork (giantswarm/phemera): Renovate is off here on purpose. This line is
+// upstream phemera-dev/phemera `main` plus the fork's own files, so upstream
+// owns the dependency graph (its Dependabot configuration); a bump opened here
+// would diverge from upstream and every sync would have to carry or revert
+// it. Dependencies move when upstream moves them; see FORK.md.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  enabled: false,
+}
