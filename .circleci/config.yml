@@ -80,12 +80,12 @@ jobs:
               ref="gsoci.azurecr.io/giantswarm/phemera/${image}:${version}"
               index=$(oras manifest fetch "${ref}")
               digest=$(oras manifest fetch --descriptor "${ref}" | jq -r .digest)
-              platforms=$(jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(",")' <<<"${index}")
+              platforms=$(printf '%s' "${index}" | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(",")')
               if [ "${platforms}" != "linux/amd64,linux/arm64" ]; then
                 echo "ERROR: ${ref} (${digest}) holds '${platforms}', not linux/amd64 and linux/arm64" >&2
                 exit 1
               fi
-              stamped=$(jq -r '.annotations["io.giantswarm.upstream.version"] // empty' <<<"${index}")
+              stamped=$(printf '%s' "${index}" | jq -r '.annotations["io.giantswarm.upstream.version"] // empty')
               if [ "${stamped}" != "main@${pin}" ]; then
                 echo "ERROR: ${ref} (${digest}) is annotated '${stamped}', the build is of main@${pin}" >&2
                 exit 1
